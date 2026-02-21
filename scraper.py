@@ -447,19 +447,18 @@ def _parse_reviews_from_soup(soup: BeautifulSoup, shop: dict) -> list[dict]:
 # Per-shop fetch
 # ──────────────────────────────────────────────────────────────────────────────
 def _get_csrf_token(html: str) -> str:
-    """Extract ASP.NET RequestVerificationToken from a page's hidden input."""
-    m = re.search(
-        r'<input[^>]+name=["\']__RequestVerificationToken["\'][^>]+value=["\']([^"\']+)["\']',
-        html,
-    )
-    if m:
-        return m.group(1)
-    # alternate attribute order
-    m = re.search(
-        r'<input[^>]+value=["\']([^"\']+)["\'][^>]+name=["\']__RequestVerificationToken["\']',
-        html,
-    )
-    return m.group(1) if m else ""
+    """
+    Extract ASP.NET RequestVerificationToken from a page's hidden input.
+    Handles any attribute order: name/type/value can appear in any sequence.
+    """
+    # Find every <input ...> tag that contains __RequestVerificationToken
+    for tag in re.findall(r'<input[^>]+>', html):
+        if '__RequestVerificationToken' in tag:
+            # Extract value="..." from this tag
+            m = re.search(r'value=["\']([^"\']+)["\']', tag)
+            if m:
+                return m.group(1)
+    return ""
 
 
 def fetch_reviews_for_shop(shop_slug: str, shop: dict, page_html: str) -> list[dict]:
@@ -479,6 +478,8 @@ def fetch_reviews_for_shop(shop_slug: str, shop: dict, page_html: str) -> list[d
         log.warning(f"    No CSRF token found for {shop['name']} – reviews skipped")
         return []
 
+    log.info(f"    CSRF token: {csrf_token[:12]}…")
+
     headers = {
         **HEADERS,
         "X-Requested-With":         "XMLHttpRequest",
@@ -493,13 +494,19 @@ def fetch_reviews_for_shop(shop_slug: str, shop: dict, page_html: str) -> list[d
 
     while True:
         payload = {
-            "shopLink": shop_slug,
-            "pageNo":   str(page_no),
-            "pageSize": "20",
+            "shopLink":                    shop_slug,
+            "pageNo":                      str(page_no),
+            "pageSize":                    "20",
+            "__RequestVerificationToken":  csrf_token,   # also as form field
         }
         try:
             resp = SESSION.post(REVIEWS_URL, data=payload, headers=headers, timeout=30)
-            resp.raise_for_status()
+            if not resp.ok:
+                log.warning(
+                    f"    Reviews HTTP {resp.status_code} (page {page_no}): "
+                    f"{resp.text[:200].strip()}"
+                )
+                break
         except requests.RequestException as exc:
             log.warning(f"    Reviews request failed (page {page_no}): {exc}")
             break
