@@ -1,0 +1,49 @@
+name: Bleems Scraper → S3
+
+on:
+  # Run every day at 02:00 UTC
+  schedule:
+    - cron: "0 2 * * *"
+
+  # Also allow manual runs from the Actions tab
+  workflow_dispatch:
+
+jobs:
+  scrape:
+    name: Scrape & Upload to S3
+    runs-on: ubuntu-latest
+    timeout-minutes: 120          # hard stop – adjust if you have many shops
+
+    env:
+      # ── AWS credentials & bucket ──────────────────────────────────────────
+      AWS_ACCESS_KEY_ID:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      AWS_DEFAULT_REGION:    ${{ secrets.AWS_DEFAULT_REGION }}
+      S3_BUCKET_NAME:        ${{ secrets.S3_BUCKET_NAME }}
+
+    steps:
+      # ── 1. Checkout code ────────────────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ── 2. Set up Python ────────────────────────────────────────────────────
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      # ── 3. Install dependencies ─────────────────────────────────────────────
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      # ── 4. Run scraper ──────────────────────────────────────────────────────
+      - name: Run Bleems scraper
+        run: python scraper.py
+
+      # ── 5. (Optional) Confirm files landed in S3 ───────────────────────────
+      - name: Verify S3 upload
+        run: |
+          aws s3 ls s3://${{ secrets.S3_BUCKET_NAME }}/ --recursive --human-readable \
+            | grep "$(date -u +%Y-%m-%d)" \
+            | tail -30
