@@ -468,37 +468,45 @@ def fetch_reviews_for_shop(shop_slug: str, shop: dict, page_html: str) -> list[d
       Body: shopLink=<slug>&pageNo=<n>&pageSize=20
       Header: RequestVerificationToken: <csrf>
 
-    ASP.NET Core antiforgery requires the token to match the antiforgery
-    cookie issued in the SAME page-load request.  We re-fetch the shop page
-    immediately before POSTing so the token and cookie are always a fresh pair.
+    ASP.NET Core antiforgery requires the cookie and hidden-field token to be
+    a matched pair from the SAME page load.  We use a brand-new, isolated
+    requests.Session for every shop so that no stale cookies from the product-
+    page fetches can interfere.  The new session GETs the shop page (which
+    sets the antiforgery cookie) and we extract the matching hidden-field token
+    from that same response before POSTing.
 
     Paginates automatically until canLoad=false.
     """
     REVIEWS_URL = f"{BASE_URL}/{COUNTRY}/ItemsList?handler=LoadReviews"
     shop_url    = f"{BASE_URL}/{COUNTRY}/shop/{shop_slug}"
 
-    # ── Re-fetch shop page for a fresh, matched token+cookie pair ─────────────
+    # ── Fresh isolated session — clean cookie jar, no product-page pollution ──
+    rev_session = requests.Session()
+    rev_session.headers.update(HEADERS)
+
     try:
-        fresh_resp = SESSION.get(shop_url, headers=HEADERS, timeout=30)
+        fresh_resp = rev_session.get(shop_url, timeout=30)
         fresh_html = fresh_resp.text
     except requests.RequestException as exc:
-        log.warning(f"    Could not re-fetch shop page for CSRF refresh: {exc}")
-        fresh_html = page_html   # fall back to original
+        log.warning(f"    Could not fetch shop page for CSRF: {exc}")
+        return []
 
     csrf_token = _get_csrf_token(fresh_html)
+
+    # ── Diagnostic: show cookies and the shopLink being used ──────────────────
+    cookie_names = [c.name for c in rev_session.cookies]
+    log.info(f"    Review-session cookies: {cookie_names}")
+    log.info(f"    shopLink={shop_slug!r}  CSRF={csrf_token[:12] if csrf_token else 'NONE'}…")
 
     if not csrf_token:
         log.warning(f"    No CSRF token found for {shop['name']} – reviews skipped")
         return []
 
-    log.info(f"    CSRF token: {csrf_token[:12]}…")
-
-    headers = {
-        **HEADERS,
+    post_headers = {
         "X-Requested-With":         "XMLHttpRequest",
-        "RequestVerificationToken": csrf_token,
+        "RequestVerificationToken": csrf_token,   # header only (matches real JS)
         "Content-Type":             "application/x-www-form-urlencoded; charset=UTF-8",
-        "Accept":                   "*/*",
+        "Accept":                   "application/json, text/javascript, */*; q=0.01",
         "Origin":                   BASE_URL,
         "Referer":                  shop_url,
     }
@@ -508,29 +516,34 @@ def fetch_reviews_for_shop(shop_slug: str, shop: dict, page_html: str) -> list[d
 
     while True:
         payload = {
-            "shopLink":                   shop_slug,
-            "pageNo":                     str(page_no),
-            "pageSize":                   "20",
-            "__RequestVerificationToken": csrf_token,   # also as form field
+            "shopLink": shop_slug,
+            "pageNo":   str(page_no),
+            "pageSize": "20",
+            # __RequestVerificationToken NOT included in body — header only
         }
         try:
-            resp = SESSION.post(REVIEWS_URL, data=payload, headers=headers, timeout=30)
+            resp = rev_session.post(
+                REVIEWS_URL, data=payload, headers=post_headers, timeout=30
+            )
             if not resp.ok:
                 log.warning(
-                    f"    Reviews HTTP {resp.status_code} (page {page_no}): "
-                    f"{resp.text[:200].strip()}"
+                    f"    Reviews HTTP {resp.status_code} (page {page_no}):\n"
+                    f"      Response headers: {dict(resp.headers)}\n"
+                    f"      Body (first 400): {resp.text[:400].strip()}"
                 )
                 break
         except requests.RequestException as exc:
             log.warning(f"    Reviews request failed (page {page_no}): {exc}")
             break
 
+        log.info(f"    Reviews POST {page_no}: status={resp.status_code} len={len(resp.text)}")
+
         try:
             j        = resp.json()
             fragment = j.get("html", "")
             can_load = j.get("canLoad", False)
         except (json.JSONDecodeError, ValueError):
-            # Response wasn't JSON — try parsing as raw HTML fragment
+            log.warning(f"    Reviews page {page_no} not JSON — treating as HTML fragment")
             fragment = resp.text
             can_load = False
 
