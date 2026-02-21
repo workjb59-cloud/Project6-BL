@@ -347,165 +347,184 @@ def fetch_shop_items(shop_html: str, shop: dict) -> list[dict]:
 # ──────────────────────────────────────────────────────────────────────────────
 # Reviews
 # ──────────────────────────────────────────────────────────────────────────────
-def _parse_reviews_from_soup(soup: BeautifulSoup, shop: dict) -> list[dict]:
-    """Parse all <li class="li-reviews"> from a BeautifulSoup object."""
+
+# Set DEBUG_HTML=1 locally to dump the first shop page HTML for inspection
+DEBUG_HTML = os.environ.get("DEBUG_HTML", "0") == "1"
+_debug_dumped = False
+
+
+def _make_review_row(shop: dict, text: str, raw_name: str, style: str) -> dict:
+    reviewer_name, review_date = _parse_reviewer(raw_name.strip())
+    star_rating = _width_to_stars(style)
+    return {
+        "shop_name":     shop["name"],
+        "shop_type":     shop["type"],
+        "reviewer_name": reviewer_name,
+        "review_date":   review_date,
+        "review_text":   text.strip(),
+        "star_rating":   star_rating,
+        "scraped_date":  TODAY,
+    }
+
+
+def _parse_reviews_from_html(html: str, shop: dict) -> list[dict]:
+    """
+    Two-strategy review parser.
+
+    Strategy A — lxml soup (handles invalid HTML like <li> inside <div>):
+      Searches by class name only (no tag restriction) to survive the
+      parser restructuring orphan <li> tags.
+
+    Strategy B — regex on raw HTML:
+      Falls back to scanning the raw HTML string for .dv-reviews-text /
+      .dv-reviews-name / .rating-on blocks when lxml still finds nothing.
+    """
     rows = []
-    for li in soup.select("li.li-reviews"):
-        text_div = li.select_one(".dv-reviews-text")
-        name_div = li.select_one(".dv-reviews-name")
-        rating_holder = li.select_one(".rating-holder .rating-on")
 
-        review_text = text_div.text.strip() if text_div else ""
-        raw_name    = name_div.text.strip()  if name_div else ""
+    # ── Strategy A: lxml parser ───────────────────────────────────────────────
+    try:
+        soup = BeautifulSoup(html, "lxml")
+    except Exception:
+        soup = BeautifulSoup(html, "html.parser")
 
-        reviewer_name, review_date = _parse_reviewer(raw_name)
-        star_rating = _width_to_stars(rating_holder.get("style", "") if rating_holder else "")
+    # Search by class only — works even if parser changes <li> → something else
+    for el in soup.find_all(class_="li-reviews"):
+        text_el   = el.find(class_="dv-reviews-text")
+        name_el   = el.find(class_="dv-reviews-name")
+        rating_el = el.find(class_="rating-on")
+        rows.append(_make_review_row(
+            shop,
+            text_el.get_text()  if text_el   else "",
+            name_el.get_text()  if name_el   else "",
+            rating_el.get("style", "") if rating_el else "",
+        ))
 
-        rows.append(
-            {
-                "shop_name":     shop["name"],
-                "shop_type":     shop["type"],
-                "reviewer_name": reviewer_name,
-                "review_date":   review_date,
-                "review_text":   review_text,
-                "star_rating":   star_rating,
-                "scraped_date":  TODAY,
-            }
-        )
+    if rows:
+        return rows
+
+    # ── Strategy B: raw-HTML regex ────────────────────────────────────────────
+    # Walk through every li-reviews block in the raw HTML string
+    block_pat = re.compile(
+        r'class=["\']li-reviews["\'].*?(?=class=["\']li-reviews["\']|</ul|</div\s*id=["\']dv_reviews)',
+        re.DOTALL,
+    )
+    text_pat   = re.compile(r'class=["\']dv-reviews-text["\'][^>]*>\s*(.*?)\s*</div', re.DOTALL)
+    name_pat   = re.compile(r'class=["\']dv-reviews-name["\'][^>]*>\s*(.*?)\s*</div', re.DOTALL)
+    rating_pat = re.compile(r'class=["\']rating-on["\']\s+style=["\']([^"\']+)["\']', re.DOTALL)
+
+    for block in block_pat.finditer(html):
+        segment = block.group(0)
+        text_m   = text_pat.search(segment)
+        name_m   = name_pat.search(segment)
+        rating_m = rating_pat.search(segment)
+        rows.append(_make_review_row(
+            shop,
+            re.sub(r"<[^>]+>", "", text_m.group(1))   if text_m   else "",
+            re.sub(r"<[^>]+>", "", name_m.group(1))   if name_m   else "",
+            rating_m.group(1)                          if rating_m else "",
+        ))
+
+    return rows
+
+
+def _parse_reviews_from_soup(soup: BeautifulSoup, shop: dict) -> list[dict]:
+    """Legacy wrapper kept for compatibility with AJAX response parsing."""
+    rows = []
+    for el in soup.find_all(class_="li-reviews"):
+        text_el   = el.find(class_="dv-reviews-text")
+        name_el   = el.find(class_="dv-reviews-name")
+        rating_el = el.find(class_="rating-on")
+        rows.append(_make_review_row(
+            shop,
+            text_el.get_text()  if text_el   else "",
+            name_el.get_text()  if name_el   else "",
+            rating_el.get("style", "") if rating_el else "",
+        ))
     return rows
 
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Per-shop fetch
 # ──────────────────────────────────────────────────────────────────────────────
-def _extract_shop_id(html: str) -> str | None:
-    """
-    Try to pull the numeric shop ID from the page HTML.
-    Looks for:
-      - data-content-piece="shopId=1077&..."
-      - var shopId = 1077;
-      - /GetShopReviews?shopId=1077
-      - ShopId=1077 in any JS/data attribute
-    """
-    patterns = [
-        r"shopId[=\s:\"']+(\d+)",           # shopId=1077  shopId: 1077
-        r"ShopId[=\s:\"']+(\d+)",
-        r"\"shop_id\"\s*:\s*(\d+)",
-        r"data-shopid=[\"'](\d+)[\"']",
-        r"/GetShopReviews\?shopId=(\d+)",
-        r"getReviews\(\s*(\d+)",
-        r"loadReviews\(\s*(\d+)",
-    ]
-    for pat in patterns:
-        m = re.search(pat, html, re.IGNORECASE)
-        if m:
-            return m.group(1)
-    return None
+def _get_csrf_token(html: str) -> str:
+    """Extract ASP.NET RequestVerificationToken from a page's hidden input."""
+    m = re.search(
+        r'<input[^>]+name=["\']__RequestVerificationToken["\'][^>]+value=["\']([^"\']+)["\']',
+        html,
+    )
+    if m:
+        return m.group(1)
+    # alternate attribute order
+    m = re.search(
+        r'<input[^>]+value=["\']([^"\']+)["\'][^>]+name=["\']__RequestVerificationToken["\']',
+        html,
+    )
+    return m.group(1) if m else ""
 
 
-def _sniff_reviews_ajax_url(html: str) -> str | None:
+def fetch_reviews_for_shop(shop_slug: str, shop: dict, page_html: str) -> list[dict]:
     """
-    Try to extract the exact AJAX URL used for reviews directly from the
-    page's inline JavaScript.  Looks for patterns like:
-      $.ajax({ url: '/kw/GetShopReviews', ... })
-      fetch('/kw/ReviewsPartial?shopId=...')
-      $.get('/kw/GetReviews', ...
-      axios.get('/kw/...')
-    Returns the full absolute URL or None.
-    """
-    patterns = [
-        # jQuery $.ajax url: '...'
-        r"""url\s*:\s*['"](\S*[Rr]eview\S*?)['"]""",
-        # fetch(url) / $.get(url) / axios.get(url)
-        r"""(?:fetch|\.get|axios\.get)\s*\(\s*['"](\S*[Rr]eview\S*?)['"]""",
-        # href/action containing review
-        r"""['"](\/[^\s'"]*[Rr]eview[^\s'"]*)['"']""",
-    ]
-    for pat in patterns:
-        m = re.search(pat, html)
-        if m:
-            path = m.group(1)
-            if path.startswith("http"):
-                return path
-            return f"{BASE_URL}{path}"
-    return None
+    Load ALL reviews via the real AJAX endpoint used by the site:
+      POST https://www.bleems.com/kw/ItemsList?handler=LoadReviews
+      Body: shopLink=<slug>&pageNo=<n>&pageSize=20
+      Header: RequestVerificationToken: <csrf>
 
+    Paginates automatically until canLoad=false.
+    Parses the HTML fragment returned in JSON {html, canLoad}.
+    """
+    REVIEWS_URL = f"{BASE_URL}/{COUNTRY}/ItemsList?handler=LoadReviews"
+    csrf_token  = _get_csrf_token(page_html)
 
-def _fetch_reviews_via_api(shop_id: str, shop: dict, sniffed_url: str | None = None) -> list[dict]:
-    """
-    Try every known AJAX endpoint that Bleems uses to serve reviews.
-    Returns a list of review dicts (may be empty if all attempts fail).
-    """
-    ajax_headers = {
+    if not csrf_token:
+        log.warning(f"    No CSRF token found for {shop['name']} – reviews skipped")
+        return []
+
+    headers = {
         **HEADERS,
-        "X-Requested-With": "XMLHttpRequest",
-        "Accept": "text/html, */*; q=0.01",
-        "Referer": f"{BASE_URL}/{COUNTRY}/shop/{shop['slug']}",
+        "X-Requested-With":         "XMLHttpRequest",
+        "RequestVerificationToken": csrf_token,
+        "Content-Type":             "application/x-www-form-urlencoded; charset=UTF-8",
+        "Accept":                   "*/*",
+        "Referer":                  f"{BASE_URL}/{COUNTRY}/shop/{shop_slug}",
     }
 
-    candidate_urls = []
-    # Put the URL sniffed from the page's own JS first (most reliable)
-    if sniffed_url:
-        # Inject shopId if the URL doesn't already contain it
-        if shop_id and "shopId" not in sniffed_url and "shopid" not in sniffed_url.lower():
-            sep = "&" if "?" in sniffed_url else "?"
-            candidate_urls.append(f"{sniffed_url}{sep}shopId={shop_id}")
-        else:
-            candidate_urls.append(sniffed_url)
+    all_rows: list[dict] = []
+    page_no = 1
 
-    candidate_urls += [
-        # Common patterns observed on .NET MVC e-commerce sites
-        f"{BASE_URL}/{COUNTRY}/GetShopReviews?shopId={shop_id}",
-        f"{BASE_URL}/{COUNTRY}/Shop/GetReviews?shopId={shop_id}",
-        f"{BASE_URL}/{COUNTRY}/Reviews/GetShopReviews?shopId={shop_id}",
-        f"{BASE_URL}/{COUNTRY}/shop/{shop['slug']}/GetReviews",
-        f"{BASE_URL}/{COUNTRY}/GetReviews?shopId={shop_id}",
-        f"{BASE_URL}/api/shop/{shop_id}/reviews",
-        f"{BASE_URL}/api/GetShopReviews?shopId={shop_id}",
-    ]
-
-    for url in candidate_urls:
+    while True:
+        payload = {
+            "shopLink": shop_slug,
+            "pageNo":   str(page_no),
+            "pageSize": "20",
+        }
         try:
-            resp = SESSION.get(url, headers=ajax_headers, timeout=20)
-            if resp.status_code != 200 or len(resp.text.strip()) < 20:
-                continue
+            resp = SESSION.post(REVIEWS_URL, data=payload, headers=headers, timeout=30)
+            resp.raise_for_status()
+        except requests.RequestException as exc:
+            log.warning(f"    Reviews request failed (page {page_no}): {exc}")
+            break
 
-            content_type = resp.headers.get("Content-Type", "")
+        try:
+            j        = resp.json()
+            fragment = j.get("html", "")
+            can_load = j.get("canLoad", False)
+        except (json.JSONDecodeError, ValueError):
+            # Response wasn't JSON — try parsing as raw HTML fragment
+            fragment = resp.text
+            can_load = False
 
-            # ── JSON response ─────────────────────────────────────────────────
-            if "json" in content_type:
-                try:
-                    data = resp.json()
-                    # Handle {"reviews": [...]} or a bare list
-                    items = data if isinstance(data, list) else data.get("reviews", data.get("Reviews", []))
-                    rows = []
-                    for r in items:
-                        rows.append({
-                            "shop_name":     shop["name"],
-                            "shop_type":     shop["type"],
-                            "reviewer_name": r.get("Name", r.get("name", r.get("ReviewerName", ""))),
-                            "review_date":   r.get("Date", r.get("date", r.get("ReviewDate", ""))),
-                            "review_text":   r.get("Text", r.get("text", r.get("Comment", r.get("comment", "")))),
-                            "star_rating":   r.get("Rating", r.get("rating", r.get("Stars", ""))),
-                            "scraped_date":  TODAY,
-                        })
-                    if rows:
-                        log.info(f"    Reviews loaded (JSON) from {url}")
-                        return rows
-                except (json.JSONDecodeError, AttributeError):
-                    pass
+        rows = _parse_reviews_from_html(fragment, shop)
+        all_rows.extend(rows)
+        log.debug(f"    Reviews page {page_no}: {len(rows)} rows (canLoad={can_load})")
 
-            # ── HTML fragment response ────────────────────────────────────────
-            soup2 = BeautifulSoup(resp.text, "html.parser")
-            rows = _parse_reviews_from_soup(soup2, shop)
-            if rows:
-                log.info(f"    Reviews loaded (HTML) from {url}")
-                return rows
+        if not can_load or not rows:
+            break
 
-        except requests.RequestException:
-            continue
+        page_no += 1
+        time.sleep(REQUEST_DELAY)
 
-    return []
+    return all_rows
+
 
 
 def fetch_shop_data(shop: dict) -> tuple[list[dict], list[dict], dict]:
@@ -537,21 +556,25 @@ def fetch_shop_data(shop: dict) -> tuple[list[dict], list[dict], dict]:
 
     items = fetch_shop_items(html, shop)
 
-    # ── Reviews: try inline HTML first, then AJAX endpoints ───────────────────
-    reviews = _parse_reviews_from_soup(soup, shop)
+    # ── Reviews: try inline HTML first (two strategies), then AJAX ────────────
+    global _debug_dumped
+    if DEBUG_HTML and not _debug_dumped:
+        dump_path = "debug_shop.html"
+        with open(dump_path, "w", encoding="utf-8") as f:
+            f.write(html)
+        log.info(f"    DEBUG: raw HTML saved to {dump_path}")
+        _debug_dumped = True
+
+    reviews = _parse_reviews_from_html(html, shop)
+    log.info(f"    inline reviews found: {len(reviews)}")
 
     if not reviews:
-        shop_id    = _extract_shop_id(html)
-        sniffed    = _sniff_reviews_ajax_url(html)
-        if sniffed:
-            log.info(f"    Sniffed reviews URL: {sniffed}")
-        if shop_id or sniffed:
-            log.info(f"    shop_id={shop_id} – trying AJAX review endpoints")
-            reviews = _fetch_reviews_via_api(shop_id or "", shop, sniffed_url=sniffed)
-            if not reviews:
-                log.warning(f"    All review endpoints returned 0 reviews for {shop['name']} (shop_id={shop_id})")
+        shop_slug = shop.get("slug", "")
+        reviews = fetch_reviews_for_shop(shop_slug, shop, html)
+        if not reviews:
+            log.warning(f"    0 reviews for {shop['name']}")
         else:
-            log.warning(f"    Could not extract shop_id for {shop['name']} – reviews skipped")
+            log.info(f"    reviews via AJAX: {len(reviews)}")
 
     shop["scraped_date"] = TODAY
     return items, reviews, shop
