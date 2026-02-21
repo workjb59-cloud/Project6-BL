@@ -468,11 +468,24 @@ def fetch_reviews_for_shop(shop_slug: str, shop: dict, page_html: str) -> list[d
       Body: shopLink=<slug>&pageNo=<n>&pageSize=20
       Header: RequestVerificationToken: <csrf>
 
+    ASP.NET Core antiforgery requires the token to match the antiforgery
+    cookie issued in the SAME page-load request.  We re-fetch the shop page
+    immediately before POSTing so the token and cookie are always a fresh pair.
+
     Paginates automatically until canLoad=false.
-    Parses the HTML fragment returned in JSON {html, canLoad}.
     """
     REVIEWS_URL = f"{BASE_URL}/{COUNTRY}/ItemsList?handler=LoadReviews"
-    csrf_token  = _get_csrf_token(page_html)
+    shop_url    = f"{BASE_URL}/{COUNTRY}/shop/{shop_slug}"
+
+    # ── Re-fetch shop page for a fresh, matched token+cookie pair ─────────────
+    try:
+        fresh_resp = SESSION.get(shop_url, headers=HEADERS, timeout=30)
+        fresh_html = fresh_resp.text
+    except requests.RequestException as exc:
+        log.warning(f"    Could not re-fetch shop page for CSRF refresh: {exc}")
+        fresh_html = page_html   # fall back to original
+
+    csrf_token = _get_csrf_token(fresh_html)
 
     if not csrf_token:
         log.warning(f"    No CSRF token found for {shop['name']} – reviews skipped")
@@ -486,7 +499,8 @@ def fetch_reviews_for_shop(shop_slug: str, shop: dict, page_html: str) -> list[d
         "RequestVerificationToken": csrf_token,
         "Content-Type":             "application/x-www-form-urlencoded; charset=UTF-8",
         "Accept":                   "*/*",
-        "Referer":                  f"{BASE_URL}/{COUNTRY}/shop/{shop_slug}",
+        "Origin":                   BASE_URL,
+        "Referer":                  shop_url,
     }
 
     all_rows: list[dict] = []
@@ -494,10 +508,10 @@ def fetch_reviews_for_shop(shop_slug: str, shop: dict, page_html: str) -> list[d
 
     while True:
         payload = {
-            "shopLink":                    shop_slug,
-            "pageNo":                      str(page_no),
-            "pageSize":                    "20",
-            "__RequestVerificationToken":  csrf_token,   # also as form field
+            "shopLink":                   shop_slug,
+            "pageNo":                     str(page_no),
+            "pageSize":                   "20",
+            "__RequestVerificationToken": csrf_token,   # also as form field
         }
         try:
             resp = SESSION.post(REVIEWS_URL, data=payload, headers=headers, timeout=30)
