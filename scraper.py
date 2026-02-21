@@ -44,7 +44,8 @@ log = logging.getLogger(__name__)
 
 BASE_URL   = "https://www.bleems.com"
 COUNTRY    = "kw"
-S3_BUCKET  = os.environ.get("S3_BUCKET_NAME", "bleems-data")
+S3_BUCKET  = os.environ.get("S3_BUCKET_NAME")        # actual bucket name from secret
+S3_FOLDER  = "bleems-data"                            # top-level folder inside the bucket
 AWS_REGION = os.environ.get("AWS_DEFAULT_REGION", "us-east-1")
 _now       = datetime.now(timezone.utc)
 TODAY      = _now.strftime("%Y-%m-%d")
@@ -394,8 +395,8 @@ def main():
             log.info(f"         items={len(items)}  reviews={len(reviews)}")
             time.sleep(REQUEST_DELAY)
 
-        # S3 prefix: year=2026/month=02/day=21/Flowers/
-        prefix = f"year={S3_YEAR}/month={S3_MONTH}/day={S3_DAY}/{shop_type}"
+        # S3 key prefix: bleems-data/year=2026/month=02/day=21/Flowers/
+        prefix = f"{S3_FOLDER}/year={S3_YEAR}/month={S3_MONTH}/day={S3_DAY}/{shop_type}"
 
         upload_df_to_s3(pd.DataFrame(enriched),    s3, f"{prefix}/shops.csv")
 
