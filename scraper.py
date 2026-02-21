@@ -461,6 +461,31 @@ def _get_csrf_token(html: str) -> str:
     return ""
 
 
+def _extract_shop_link(html: str, slug: str) -> str:
+    """
+    Find the shopLink value the page's own JavaScript uses for the reviews API.
+
+    The site embeds something like:
+        var shopLink = '/kw/shop/89sweet';
+    or it may live in a data attribute:
+        data-shop-link="/kw/shop/89sweet"
+
+    Falls back to the full path  /<COUNTRY>/shop/<slug>  if nothing is found.
+    """
+    # 1) JS variable: var shopLink = '...'; or shopLink = "...";
+    m = re.search(r'shopLink\s*=\s*["\']([^"\']+)["\']', html)
+    if m:
+        return m.group(1)
+
+    # 2) data attribute: data-shop-link="..."
+    m = re.search(r'data-shop-link=["\']([^"\']+)["\']', html)
+    if m:
+        return m.group(1)
+
+    # 3) Safe fallback — full relative path
+    return f"/{COUNTRY}/shop/{slug}"
+
+
 def fetch_reviews_for_shop(shop_slug: str, shop: dict, page_html: str) -> list[dict]:
     """
     Load ALL reviews via the real AJAX endpoint used by the site:
@@ -492,11 +517,12 @@ def fetch_reviews_for_shop(shop_slug: str, shop: dict, page_html: str) -> list[d
         return []
 
     csrf_token = _get_csrf_token(fresh_html)
+    shop_link  = _extract_shop_link(fresh_html, shop_slug)
 
     # ── Diagnostic: show cookies and the shopLink being used ──────────────────
     cookie_names = [c.name for c in rev_session.cookies]
     log.info(f"    Review-session cookies: {cookie_names}")
-    log.info(f"    shopLink={shop_slug!r}  CSRF={csrf_token[:12] if csrf_token else 'NONE'}…")
+    log.info(f"    shopLink={shop_link!r}  CSRF={csrf_token[:12] if csrf_token else 'NONE'}…")
 
     if not csrf_token:
         log.warning(f"    No CSRF token found for {shop['name']} – reviews skipped")
@@ -516,7 +542,7 @@ def fetch_reviews_for_shop(shop_slug: str, shop: dict, page_html: str) -> list[d
 
     while True:
         payload = {
-            "shopLink": shop_slug,
+            "shopLink": shop_link,   # full path e.g. /kw/shop/89sweet
             "pageNo":   str(page_no),
             "pageSize": "20",
             # __RequestVerificationToken NOT included in body — header only
