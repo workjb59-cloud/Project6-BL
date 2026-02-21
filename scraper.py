@@ -121,122 +121,225 @@ def fetch_all_shops() -> list[dict]:
     """
     url = f"{BASE_URL}/{COUNTRY}/shops"
     log.info(f"Fetching shop list from {url}")
-    soup = BeautifulSoup(_get(url).text, "html.parser")
+    html = _get(url).text
+    soup = BeautifulSoup(html, "html.parser")
 
-    shops = []
-    for el in soup.select("a.brand-a-z-list-item"):
-        href = el.get("href", "")
-        slug = href.split("/shop/")[-1].rstrip("/") if "/shop/" in href else ""
-        img  = el.select_one("img")
+    def _parse_shops(use_data_attr: bool) -> list[dict]:
+        result = []
+        for el in soup.select("a.brand-a-z-list-item"):
+            href     = el.get("href", "")
+            slug     = href.split("/shop/")[-1].rstrip("/") if "/shop/" in href else ""
+            img      = el.select_one("img")
+            name_div = el.select_one(".brand-a-z-item-name")
+            type_div = el.select_one(".brand-a-z-item-type")
 
-        name_div = el.select_one(".brand-a-z-item-name")
-        type_div = el.select_one(".brand-a-z-item-type")
+            if use_data_attr:
+                type_text = el.get("data-type", "Other").strip()
+            else:
+                type_text = (
+                    type_div.text.strip() if (type_div and type_div.text.strip())
+                    else el.get("data-type", "Other").strip()
+                )
 
-        raw_type = (
-            type_div.text.strip() if type_div else el.get("data-type", "Other")
-        ).title()
-
-        shops.append(
-            {
+            result.append({
                 "name":          (name_div.text.strip() if name_div else el.get("data-name", "")).strip(),
-                "type":          raw_type,
+                "type":          type_text.title(),
                 "rating":        el.get("data-rating", ""),
                 "ratings_count": el.get("data-count", ""),
                 "slug":          slug,
                 "url":           f"{BASE_URL}{href}" if href.startswith("/") else href,
                 "logo_url":      img.get("src", "") if img else "",
-            }
-        )
+            })
+        return result
 
-    log.info(f"Found {len(shops)} shops total")
+    shops = _parse_shops(use_data_attr=False)
+    unique_types = sorted({s["type"] for s in shops})
+    log.info(f"Found {len(shops)} shops. Types from HTML text: {unique_types}")
+
+    # If the listing page JS-filters to one type, use data-type attribute instead
+    if len(unique_types) <= 1:
+        log.warning(
+            "Only one type found in visible text — falling back to data-type attribute."
+        )
+        shops = _parse_shops(use_data_attr=True)
+        unique_types = sorted({s["type"] for s in shops})
+        log.info(f"Types from data-type attribute: {unique_types}")
+
     return shops
 
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Items
 # ──────────────────────────────────────────────────────────────────────────────
-def _extract_track_json_blocks(html: str) -> list[dict]:
+
+# HTML entity map for JS strings
+_HTML_ENTITIES = {
+    "&#x1F382;": "🎂", "&#x1F319;": "🌙", "&#x1F381;": "🎁",
+    "&#x1F338;": "🌸", "&#x1F490;": "💐", "&#x1F36C;": "🍬",
+    "&amp;": "&", "&lt;": "<", "&gt;": ">", "&quot;": '"',
+}
+
+
+def _js_obj_to_json(raw: str) -> str:
     """
-    Pull every `var trackJson = { … };` block from a page's HTML
-    and return a list of parsed dicts.
+    Convert a JavaScript object literal (single-quoted keys/values,
+    decodeHTMLString() calls) to valid JSON that json.loads() can parse.
     """
-    results = []
-    # Match multiline JS object literal assigned to trackJson
-    pattern = re.compile(
-        r"var\s+trackJson\s*=\s*(\{.*?\})\s*;",
-        re.DOTALL,
+    # 1. Replace decodeHTMLString('...') with a proper JSON string
+    raw = re.sub(
+        r"decodeHTMLString\(['\"]([^'\"]*?)['\"]\)",
+        lambda m: json.dumps(m.group(1)),
+        raw,
     )
-    for m in pattern.finditer(html):
-        raw = m.group(1)
-        # Replace JS function calls: decodeHTMLString('…') → "…"
-        raw = re.sub(r"decodeHTMLString\(['\"]([^'\"]*?)['\"]\)", r'"\1"', raw)
-        # Replace HTML entities inside strings
-        raw = raw.replace("&#x1F382;", "🎂").replace("&amp;", "&")
-        # Remove trailing commas before } or ]
-        raw = re.sub(r",\s*([}\]])", r"\1", raw)
-        try:
-            results.append(json.loads(raw))
-        except json.JSONDecodeError as exc:
-            log.debug(f"trackJson parse error: {exc}")
-    return results
+
+    # 2. Replace HTML entities
+    for ent, char in _HTML_ENTITIES.items():
+        raw = raw.replace(ent, char)
+
+    # 3. Convert single-quoted strings to double-quoted strings
+    #    Walk character by character to handle nested quotes safely
+    result = []
+    i = 0
+    in_double = False
+    while i < len(raw):
+        ch = raw[i]
+        if ch == '"':
+            in_double = not in_double
+            result.append(ch)
+        elif ch == "'" and not in_double:
+            # Collect until matching closing single-quote
+            j = i + 1
+            buf = []
+            while j < len(raw):
+                c = raw[j]
+                if c == "'":
+                    break
+                if c == '"':
+                    buf.append('\\"')   # escape embedded double-quotes
+                else:
+                    buf.append(c)
+                j += 1
+            result.append('"')
+            result.extend(buf)
+            result.append('"')
+            i = j + 1
+            continue
+        else:
+            result.append(ch)
+        i += 1
+    raw = "".join(result)
+
+    # 4. Remove trailing commas before } or ]
+    raw = re.sub(r",\s*([}\]])", r"\1", raw)
+    return raw
 
 
-def _parse_items_from_page(html: str, shop: dict) -> list[dict]:
-    """Extract product rows from a shop page."""
-    soup  = BeautifulSoup(html, "html.parser")
+def _extract_track_json(html: str) -> dict | None:
+    """
+    Extract the single `var trackJson = { … };` from a product page and
+    return it as a parsed dict, or None if not found / unparseable.
+    """
+    m = re.search(r"var\s+trackJson\s*=\s*(\{.*?\})\s*;", html, re.DOTALL)
+    if not m:
+        return None
+    try:
+        return json.loads(_js_obj_to_json(m.group(1)))
+    except Exception as exc:
+        log.debug(f"trackJson parse error: {exc}")
+        return None
+
+
+def _collect_product_urls(shop_html: str) -> list[tuple[str, str]]:
+    """
+    Return a list of (product_url, div_target_key) tuples from a shop page.
+    Each .dv-item-head[data-content-target] carries the relative product path.
+    """
+    soup = BeautifulSoup(shop_html, "html.parser")
+    seen, pairs = set(), []
+    for div in soup.select(".dv-item-head[data-content-target]"):
+        target = div.get("data-content-target", "").strip().lstrip("/")
+        if target and target not in seen:
+            seen.add(target)
+            pairs.append((f"{BASE_URL}/{COUNTRY}/{target}", target))
+    return pairs
+
+
+def _row_from_track_json(data: dict, shop: dict) -> dict:
+    """Build a flat item CSV row from a parsed trackJson dict."""
+    flavors = data.get("flavor", [])
+    colors  = data.get("color",  [])
+    return {
+        "shop_name":    shop["name"],
+        "shop_type":    shop["type"],
+        "product_id":   data.get("content_id", ""),
+        "product_name": data.get("product", "").strip(),
+        "category":     data.get("category", ""),
+        "brand":        data.get("brand", ""),
+        "price":        data.get("product_price", ""),
+        "currency":     data.get("currency", "KWD"),
+        "occasion":     data.get("occasion", ""),
+        "product_type": data.get("product_type", ""),
+        "sub_category": data.get("sub_category", ""),
+        "flavors":      ", ".join(flavors) if isinstance(flavors, list) else str(flavors),
+        "colors":       ", ".join(colors)  if isinstance(colors,  list) else str(colors),
+        "product_url":  data.get("product_url", ""),
+        "image_url":    data.get("product_image_url", ""),
+    }
+
+
+def fetch_shop_items(shop_html: str, shop: dict) -> list[dict]:
+    """
+    Fetch all products for a shop by visiting each individual product page
+    (trackJson is only embedded on the product detail page, not the shop listing).
+
+    Falls back to minimal row (product_id + image only) if a page fails.
+    """
+    pairs    = _collect_product_urls(shop_html)
+    shop_soup = BeautifulSoup(shop_html, "html.parser")
+
+    # Build lookup: target_key → div, for fallback metadata
+    div_lookup: dict[str, object] = {}
+    for div in shop_soup.select(".dv-item-head[data-content-target]"):
+        key = div.get("data-content-target", "").strip().lstrip("/")
+        div_lookup[key] = div
+
     items = []
+    log.info(f"    Fetching {len(pairs)} product pages …")
 
-    # ── 1. Pull structured data from embedded trackJson ──────────────────────
-    for data in _extract_track_json_blocks(html):
-        flavors = data.get("flavor", [])
-        colors  = data.get("color",  [])
-        items.append(
-            {
+    for prod_url, target_key in pairs:
+        time.sleep(REQUEST_DELAY)
+        data = None
+        try:
+            resp = SESSION.get(prod_url, timeout=30)
+            if resp.status_code == 200:
+                data = _extract_track_json(resp.text)
+        except requests.RequestException as exc:
+            log.debug(f"    Product fetch error {prod_url}: {exc}")
+
+        if data:
+            items.append(_row_from_track_json(data, shop))
+        else:
+            # Minimal fallback row from shop listing div
+            div = div_lookup.get(target_key)
+            pid    = div.get("data-content-name", "").replace("Product_", "") if div else ""
+            img_el = div.select_one("img") if div else None
+            items.append({
                 "shop_name":    shop["name"],
                 "shop_type":    shop["type"],
-                "product_id":   data.get("content_id", ""),
-                "product_name": data.get("product", "").strip(),
-                "category":     data.get("category", ""),
-                "brand":        data.get("brand", ""),
-                "price":        data.get("product_price", ""),
-                "currency":     data.get("currency", "KWD"),
-                "occasion":     data.get("occasion", ""),
-                "product_type": data.get("product_type", ""),
-                "sub_category": data.get("sub_category", ""),
-                "flavors":      ", ".join(flavors) if isinstance(flavors, list) else str(flavors),
-                "colors":       ", ".join(colors)  if isinstance(colors,  list) else str(colors),
-                "product_url":  data.get("product_url", ""),
-                "image_url":    data.get("product_image_url", ""),
-            }
-        )
-
-    # ── 2. Fallback: parse .dv-item-head elements for anything missed ─────────
-    seen_ids = {i["product_id"] for i in items}
-    for div in soup.select(".dv-item-head"):
-        pid  = div.get("data-content-name", "").replace("Product_", "")
-        a    = div.select_one("a.item-img")
-        img  = div.select_one("img")
-        if pid and pid not in seen_ids:
-            items.append(
-                {
-                    "shop_name":    shop["name"],
-                    "shop_type":    shop["type"],
-                    "product_id":   pid,
-                    "product_name": "",
-                    "category":     "",
-                    "brand":        shop["name"],
-                    "price":        "",
-                    "currency":     "KWD",
-                    "occasion":     "",
-                    "product_type": "",
-                    "sub_category": "",
-                    "flavors":      "",
-                    "colors":       "",
-                    "product_url":  (a.get("href", "") if a else ""),
-                    "image_url":    (img.get("src", "") if img else ""),
-                }
-            )
-            seen_ids.add(pid)
+                "product_id":   pid,
+                "product_name": "",
+                "category":     "",
+                "brand":        shop["name"],
+                "price":        "",
+                "currency":     "KWD",
+                "occasion":     "",
+                "product_type": "",
+                "sub_category": "",
+                "flavors":      "",
+                "colors":       "",
+                "product_url":  prod_url,
+                "image_url":    img_el.get("src", "") if img_el else "",
+            })
 
     return items
 
@@ -432,7 +535,7 @@ def fetch_shop_data(shop: dict) -> tuple[list[dict], list[dict], dict]:
             if m:
                 shop["ratings_count"] = int(m.group())
 
-    items = _parse_items_from_page(html, shop)
+    items = fetch_shop_items(html, shop)
 
     # ── Reviews: try inline HTML first, then AJAX endpoints ───────────────────
     reviews = _parse_reviews_from_soup(soup, shop)
