@@ -488,18 +488,21 @@ def _extract_shop_link(html: str, slug: str) -> str:
 
 def fetch_reviews_for_shop(shop_slug: str, shop: dict, page_html: str) -> list[dict]:
     """
-    Load ALL reviews via the real AJAX endpoint used by the site:
-      POST https://www.bleems.com/kw/ItemsList?handler=LoadReviews
-      Body: shopLink=<slug>&pageNo=<n>&pageSize=20
-      Header: RequestVerificationToken: <csrf>
+    Load ALL reviews via the AJAX endpoint used by the site:
+      GET https://www.bleems.com/kw/ItemsList?handler=LoadReviews
+      Params: shopLink=<bare-slug>&pageNo=<n>&pageSize=20
+      Header: RequestVerificationToken: <token>
 
-    ASP.NET Core antiforgery requires the cookie and hidden-field token to be
-    a matched pair from the SAME page load.  We use a brand-new, isolated
-    requests.Session for every shop so that no stale cookies from the product-
-    page fetches can interfere.  The new session GETs the shop page (which
-    sets the antiforgery cookie) and we extract the matching hidden-field token
-    from that same response before POSTing.
+    Real JS example:
+        $.ajax({
+            url: "https://www.bleems.com/kw/ItemsList?handler=LoadReviews",
+            data: {'shopLink':'auntyjujus', 'pageNo':1, 'pageSize':'20'},
+            beforeSend: function(xhr) {
+                xhr.setRequestHeader("RequestVerificationToken", $('input[name="__RequestVerificationToken"]').val());
+            }
+        });
 
+    Uses a fresh isolated session to avoid cookie pollution from product pages.
     Paginates automatically until canLoad=false.
     """
     REVIEWS_URL = f"{BASE_URL}/{COUNTRY}/ItemsList?handler=LoadReviews"
@@ -517,23 +520,16 @@ def fetch_reviews_for_shop(shop_slug: str, shop: dict, page_html: str) -> list[d
         return []
 
     csrf_token = _get_csrf_token(fresh_html)
-    shop_link  = _extract_shop_link(fresh_html, shop_slug)
-
-    # ── Diagnostic: show cookies and the shopLink being used ──────────────────
-    cookie_names = [c.name for c in rev_session.cookies]
-    log.info(f"    Review-session cookies: {cookie_names}")
-    log.info(f"    shopLink={shop_link!r}  CSRF={csrf_token[:12] if csrf_token else 'NONE'}…")
-
     if not csrf_token:
         log.warning(f"    No CSRF token found for {shop['name']} – reviews skipped")
         return []
 
-    post_headers = {
+    log.info(f"    shopLink={shop_slug!r} (bare slug)  CSRF={csrf_token[:12]}…")
+
+    get_headers = {
         "X-Requested-With":         "XMLHttpRequest",
-        "RequestVerificationToken": csrf_token,   # header only (matches real JS)
-        "Content-Type":             "application/x-www-form-urlencoded; charset=UTF-8",
+        "RequestVerificationToken": csrf_token,  # Required by ASP.NET handler
         "Accept":                   "application/json, text/javascript, */*; q=0.01",
-        "Origin":                   BASE_URL,
         "Referer":                  shop_url,
     }
 
@@ -541,15 +537,16 @@ def fetch_reviews_for_shop(shop_slug: str, shop: dict, page_html: str) -> list[d
     page_no = 1
 
     while True:
-        payload = {
-            "shopLink": shop_link,   # full path e.g. /kw/shop/89sweet
+        params = {
+            "shopLink": shop_slug,   # BARE SLUG (e.g. 'auntyjujus', not '/kw/shop/auntyjujus')
             "pageNo":   str(page_no),
             "pageSize": "20",
-            # __RequestVerificationToken NOT included in body — header only
         }
+        if page_no == 1:  # Log first request for debugging
+            log.info(f"    GET {REVIEWS_URL}?shopLink={shop_slug}&pageNo=1&pageSize=20")
         try:
-            resp = rev_session.post(
-                REVIEWS_URL, data=payload, headers=post_headers, timeout=30
+            resp = rev_session.get(
+                REVIEWS_URL, params=params, headers=get_headers, timeout=30
             )
             if not resp.ok:
                 log.warning(
@@ -562,7 +559,7 @@ def fetch_reviews_for_shop(shop_slug: str, shop: dict, page_html: str) -> list[d
             log.warning(f"    Reviews request failed (page {page_no}): {exc}")
             break
 
-        log.info(f"    Reviews POST {page_no}: status={resp.status_code} len={len(resp.text)}")
+        log.info(f"    Reviews GET {page_no}: status={resp.status_code} len={len(resp.text)}")
 
         try:
             j        = resp.json()
