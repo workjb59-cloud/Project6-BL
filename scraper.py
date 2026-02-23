@@ -815,7 +815,6 @@ def main():
             f"{len(all_reviews)} reviews | Images: {shops_with_images} shop logos, "
             f"{items_with_images} product images"
         )
-        )
 
     log.info("\nAll done!")
 
