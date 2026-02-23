@@ -575,29 +575,33 @@ def fetch_reviews_for_shop(shop_slug: str, shop: dict, page_html: str) -> list[d
             resp = rev_session.get(
                 REVIEWS_URL, params=params, headers=get_headers, timeout=30
             )
-            # Explicitly set encoding to UTF-8 for Arabic text
-            resp.encoding = 'utf-8'
             
             if not resp.ok:
                 log.warning(
                     f"    Reviews HTTP {resp.status_code} (page {page_no}):\n"
                     f"      Response headers: {dict(resp.headers)}\n"
-                    f"      Body (first 400): {resp.text[:400].strip()}"
+                    f"      Body (first 400): {resp.content.decode('utf-8', errors='ignore')[:400].strip()}"
                 )
                 break
         except requests.RequestException as exc:
             log.warning(f"    Reviews request failed (page {page_no}): {exc}")
             break
 
-        log.info(f"    Reviews GET {page_no}: status={resp.status_code} len={len(resp.text)}")
+        # Decode response as UTF-8 explicitly to handle Arabic text correctly
+        try:
+            text = resp.content.decode('utf-8')
+        except UnicodeDecodeError:
+            text = resp.content.decode('utf-8', errors='replace')
+        
+        log.info(f"    Reviews GET {page_no}: status={resp.status_code} len={len(text)}")
 
         try:
-            j        = resp.json()
+            j        = json.loads(text)
             fragment = j.get("html", "")
             can_load = j.get("canLoad", False)
         except (json.JSONDecodeError, ValueError):
             log.warning(f"    Reviews page {page_no} not JSON — treating as HTML fragment")
-            fragment = resp.text
+            fragment = text
             can_load = False
 
         rows = _parse_reviews_from_html(fragment, shop)
