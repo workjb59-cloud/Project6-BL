@@ -312,7 +312,7 @@ def fetch_shop_items(shop_html: str, shop: dict, s3: "boto3.client") -> list[dic
 
     # Clean shop name for folder path
     clean_shop_name = re.sub(r'[^\w\-]', '_', shop['name'])
-    shop_type_lower = shop['type'].lower()
+    shop_type_folder = shop['type']  # Use same case as CSV files (Flowers, Confections)
 
     for prod_url, target_key in pairs:
         time.sleep(REQUEST_DELAY)
@@ -359,8 +359,8 @@ def fetch_shop_items(shop_html: str, shop: dict, s3: "boto3.client") -> list[dic
             if "." in item["image_url"]:
                 ext = item["image_url"].split(".")[-1].split("?")[0][:4]
             
-            # Partition by date first: bleems-data/year=2026/month=02/day=23/flowers/images/...
-            s3_image_path = f"{S3_FOLDER}/year={S3_YEAR}/month={S3_MONTH}/day={S3_DAY}/{shop_type_lower}/images/{clean_shop_name}/products/{product_id}.{ext}"
+            # Partition by date first: bleems-data/year=2026/month=02/day=23/Flowers/images/...
+            s3_image_path = f"{S3_FOLDER}/year={S3_YEAR}/month={S3_MONTH}/day={S3_DAY}/{shop_type_folder}/images/{clean_shop_name}/products/{product_id}.{ext}"
             uploaded_path = upload_image_to_s3(item["image_url"], s3_image_path, s3)
             if uploaded_path:
                 item["s3_image_path"] = uploaded_path
@@ -651,15 +651,15 @@ def fetch_shop_data(shop: dict, s3: "boto3.client") -> tuple[list[dict], list[di
     if shop.get("logo_url"):
         # Clean shop name for folder path (remove special chars)
         clean_shop_name = re.sub(r'[^\w\-]', '_', shop['name'])
-        shop_type_lower = shop['type'].lower()
+        shop_type_folder = shop['type']  # Use same case as CSV files (Flowers, Confections)
         
         # Extract file extension from URL
         ext = "jpg"
         if "." in shop["logo_url"]:
             ext = shop["logo_url"].split(".")[-1].split("?")[0][:4]
         
-        # Partition by date first: bleems-data/year=2026/month=02/day=23/flowers/images/...
-        s3_logo_path = f"{S3_FOLDER}/year={S3_YEAR}/month={S3_MONTH}/day={S3_DAY}/{shop_type_lower}/images/{clean_shop_name}/logo/logo.{ext}"
+        # Partition by date first: bleems-data/year=2026/month=02/day=23/Flowers/images/...
+        s3_logo_path = f"{S3_FOLDER}/year={S3_YEAR}/month={S3_MONTH}/day={S3_DAY}/{shop_type_folder}/images/{clean_shop_name}/logo/logo.{ext}"
         uploaded_path = upload_image_to_s3(shop["logo_url"], s3_logo_path, s3)
         if uploaded_path:
             shop["s3_image_path"] = uploaded_path
