@@ -2,20 +2,22 @@
 Bleems.com full scraper
 -----------------------
 Scrapes all shops (grouped by type: Flowers, Confections, Gifts, …),
-their items, and their reviews, then uploads partitioned CSVs to S3.
+their items, and their reviews, then uploads partitioned CSVs and images to S3.
 
 S3 structure:
-  <bucket>/Flowers/date=YYYY-MM-DD/shops.csv
-  <bucket>/Flowers/date=YYYY-MM-DD/items.csv
-  <bucket>/Flowers/date=YYYY-MM-DD/reviews.csv
-  <bucket>/Confections/date=YYYY-MM-DD/...
+  <bucket>/bleems-data/year=2026/month=02/day=23/flowers/shops.csv
+  <bucket>/bleems-data/year=2026/month=02/day=23/flowers/items.csv
+  <bucket>/bleems-data/year=2026/month=02/day=23/flowers/reviews.csv
+  <bucket>/bleems-data/year=2026/month=02/day=23/flowers/images/{shop-name}/logo/logo.jpg
+  <bucket>/bleems-data/year=2026/month=02/day=23/flowers/images/{shop-name}/products/{product-id}.jpg
+  <bucket>/bleems-data/year=2026/month=02/day=23/confections/...
   ...
 
 Environment variables (set via GitHub Actions secrets):
   AWS_ACCESS_KEY_ID
   AWS_SECRET_ACCESS_KEY
   AWS_DEFAULT_REGION   (default: us-east-1)
-  S3_BUCKET_NAME       (default: bleems-data)
+  S3_BUCKET_NAME       (actual bucket name)
 """
 
 import os
@@ -79,6 +81,7 @@ def _get(url: str, **kwargs) -> requests.Response:
     for attempt in range(1, 4):
         try:
             resp = SESSION.get(url, timeout=30, **kwargs)
+            resp.encoding = 'utf-8'  # Ensure Arabic text is decoded correctly
             resp.raise_for_status()
             return resp
         except requests.RequestException as exc:
@@ -287,11 +290,12 @@ def _row_from_track_json(data: dict, shop: dict) -> dict:
     }
 
 
-def fetch_shop_items(shop_html: str, shop: dict) -> list[dict]:
+def fetch_shop_items(shop_html: str, shop: dict, s3: "boto3.client") -> list[dict]:
     """
     Fetch all products for a shop by visiting each individual product page
     (trackJson is only embedded on the product detail page, not the shop listing).
 
+    Downloads and uploads product images to S3.
     Falls back to minimal row (product_id + image only) if a page fails.
     """
     pairs    = _collect_product_urls(shop_html)
@@ -306,24 +310,29 @@ def fetch_shop_items(shop_html: str, shop: dict) -> list[dict]:
     items = []
     log.info(f"    Fetching {len(pairs)} product pages …")
 
+    # Clean shop name for folder path
+    clean_shop_name = re.sub(r'[^\w\-]', '_', shop['name'])
+    shop_type_lower = shop['type'].lower()
+
     for prod_url, target_key in pairs:
         time.sleep(REQUEST_DELAY)
         data = None
         try:
             resp = SESSION.get(prod_url, timeout=30)
+            resp.encoding = 'utf-8'  # Ensure Arabic text is decoded correctly
             if resp.status_code == 200:
                 data = _extract_track_json(resp.text)
         except requests.RequestException as exc:
             log.debug(f"    Product fetch error {prod_url}: {exc}")
 
         if data:
-            items.append(_row_from_track_json(data, shop))
+            item = _row_from_track_json(data, shop)
         else:
             # Minimal fallback row from shop listing div
             div = div_lookup.get(target_key)
             pid    = div.get("data-content-name", "").replace("Product_", "") if div else ""
             img_el = div.select_one("img") if div else None
-            items.append({
+            item = {
                 "shop_name":    shop["name"],
                 "shop_type":    shop["type"],
                 "product_id":   pid,
@@ -339,7 +348,24 @@ def fetch_shop_items(shop_html: str, shop: dict) -> list[dict]:
                 "colors":       "",
                 "product_url":  prod_url,
                 "image_url":    img_el.get("src", "") if img_el else "",
-            })
+            }
+        
+        # Download and upload product image to S3
+        item["s3_image_path"] = ""
+        if item.get("image_url"):
+            product_id = item.get("product_id", "unknown")
+            # Extract file extension
+            ext = "jpg"
+            if "." in item["image_url"]:
+                ext = item["image_url"].split(".")[-1].split("?")[0][:4]
+            
+            # Partition by date first: bleems-data/year=2026/month=02/day=23/flowers/images/...
+            s3_image_path = f"{S3_FOLDER}/year={S3_YEAR}/month={S3_MONTH}/day={S3_DAY}/{shop_type_lower}/images/{clean_shop_name}/products/{product_id}.{ext}"
+            uploaded_path = upload_image_to_s3(item["image_url"], s3_image_path, s3)
+            if uploaded_path:
+                item["s3_image_path"] = uploaded_path
+
+        items.append(item)
 
     return items
 
@@ -514,6 +540,7 @@ def fetch_reviews_for_shop(shop_slug: str, shop: dict, page_html: str) -> list[d
 
     try:
         fresh_resp = rev_session.get(shop_url, timeout=30)
+        fresh_resp.encoding = 'utf-8'  # Ensure Arabic text is decoded correctly
         fresh_html = fresh_resp.text
     except requests.RequestException as exc:
         log.warning(f"    Could not fetch shop page for CSRF: {exc}")
@@ -548,6 +575,9 @@ def fetch_reviews_for_shop(shop_slug: str, shop: dict, page_html: str) -> list[d
             resp = rev_session.get(
                 REVIEWS_URL, params=params, headers=get_headers, timeout=30
             )
+            # Explicitly set encoding to UTF-8 for Arabic text
+            resp.encoding = 'utf-8'
+            
             if not resp.ok:
                 log.warning(
                     f"    Reviews HTTP {resp.status_code} (page {page_no}):\n"
@@ -584,10 +614,11 @@ def fetch_reviews_for_shop(shop_slug: str, shop: dict, page_html: str) -> list[d
 
 
 
-def fetch_shop_data(shop: dict) -> tuple[list[dict], list[dict], dict]:
+def fetch_shop_data(shop: dict, s3: "boto3.client") -> tuple[list[dict], list[dict], dict]:
     """
     Fetch a single shop page.
     Returns (items, reviews, enriched_shop_dict).
+    Downloads and uploads shop logo and product images to S3.
     """
     url = f"{BASE_URL}/{COUNTRY}/shop/{shop['slug']}"
     try:
@@ -611,7 +642,26 @@ def fetch_shop_data(shop: dict) -> tuple[list[dict], list[dict], dict]:
             if m:
                 shop["ratings_count"] = int(m.group())
 
-    items = fetch_shop_items(html, shop)
+    # ── Download and upload shop logo to S3 ───────────────────────────────────
+    shop["s3_image_path"] = ""
+    if shop.get("logo_url"):
+        # Clean shop name for folder path (remove special chars)
+        clean_shop_name = re.sub(r'[^\w\-]', '_', shop['name'])
+        shop_type_lower = shop['type'].lower()
+        
+        # Extract file extension from URL
+        ext = "jpg"
+        if "." in shop["logo_url"]:
+            ext = shop["logo_url"].split(".")[-1].split("?")[0][:4]
+        
+        # Partition by date first: bleems-data/year=2026/month=02/day=23/flowers/images/...
+        s3_logo_path = f"{S3_FOLDER}/year={S3_YEAR}/month={S3_MONTH}/day={S3_DAY}/{shop_type_lower}/images/{clean_shop_name}/logo/logo.{ext}"
+        uploaded_path = upload_image_to_s3(shop["logo_url"], s3_logo_path, s3)
+        if uploaded_path:
+            shop["s3_image_path"] = uploaded_path
+            log.debug(f"    Logo uploaded: {uploaded_path}")
+
+    items = fetch_shop_items(html, shop, s3)
 
     # ── Reviews: try inline HTML first (two strategies), then AJAX ────────────
     global _debug_dumped
@@ -640,6 +690,35 @@ def fetch_shop_data(shop: dict) -> tuple[list[dict], list[dict], dict]:
 # ──────────────────────────────────────────────────────────────────────────────
 # S3 upload
 # ──────────────────────────────────────────────────────────────────────────────
+def upload_image_to_s3(image_url: str, s3_path: str, s3: "boto3.client") -> str:
+    """
+    Download an image from a URL and upload it to S3.
+    Returns the S3 path on success, empty string on failure.
+    """
+    if not image_url or not s3_path:
+        return ""
+    
+    try:
+        # Download image
+        resp = SESSION.get(image_url, timeout=30, stream=True)
+        resp.raise_for_status()
+        
+        # Determine content type
+        content_type = resp.headers.get('Content-Type', 'image/jpeg')
+        
+        # Upload to S3
+        s3.put_object(
+            Bucket=S3_BUCKET,
+            Key=s3_path,
+            Body=resp.content,
+            ContentType=content_type,
+        )
+        return s3_path
+    except Exception as exc:
+        log.debug(f"    Image upload failed {image_url} -> {s3_path}: {exc}")
+        return ""
+
+
 def upload_df_to_s3(df: pd.DataFrame, s3: "boto3.client", key: str):
     """Serialize a DataFrame as UTF-8 CSV and put it in S3."""
     buf = StringIO()
@@ -700,10 +779,11 @@ def main():
 
             if not shop.get("slug"):
                 log.warning("    No slug – skipped")
+                shop["s3_image_path"] = ""  # Add empty s3_image_path for consistency
                 enriched.append(shop)
                 continue
 
-            items, reviews, updated_shop = fetch_shop_data(shop)
+            items, reviews, updated_shop = fetch_shop_data(shop, s3)
             all_items.extend(items)
             all_reviews.extend(reviews)
             enriched.append(updated_shop)
@@ -714,6 +794,10 @@ def main():
         # S3 key prefix: bleems-data/year=2026/month=02/day=21/Flowers/
         prefix = f"{S3_FOLDER}/year={S3_YEAR}/month={S3_MONTH}/day={S3_DAY}/{shop_type}"
 
+        # Count images uploaded
+        shops_with_images = sum(1 for s in enriched if s.get("s3_image_path"))
+        items_with_images = sum(1 for i in all_items if i.get("s3_image_path"))
+        
         upload_df_to_s3(pd.DataFrame(enriched),    s3, f"{prefix}/shops.csv")
 
         if all_items:
@@ -727,8 +811,10 @@ def main():
             log.warning(f"  No reviews found for {shop_type}")
 
         log.info(
-            f"  Done {shop_type}: {len(enriched)} shops | "
-            f"{len(all_items)} items | {len(all_reviews)} reviews"
+            f"  Done {shop_type}: {len(enriched)} shops, {len(all_items)} items, "
+            f"{len(all_reviews)} reviews | Images: {shops_with_images} shop logos, "
+            f"{items_with_images} product images"
+        )
         )
 
     log.info("\nAll done!")
