@@ -25,7 +25,7 @@ import re
 import json
 import time
 import logging
-from io import StringIO
+from io import StringIO, BytesIO
 from datetime import datetime, timezone
 
 import requests
@@ -408,20 +408,41 @@ def _parse_reviews_from_html(html: str, shop: dict) -> list[dict]:
     rows = []
 
     # ── Strategy A: lxml parser ───────────────────────────────────────────────
+    # Ensure HTML is properly encoded as UTF-8 bytes for BeautifulSoup
     try:
-        soup = BeautifulSoup(html, "lxml")
+        if isinstance(html, str):
+            html_bytes = html.encode('utf-8')
+        else:
+            html_bytes = html
+        soup = BeautifulSoup(html_bytes, "lxml", from_encoding="utf-8")
     except Exception:
-        soup = BeautifulSoup(html, "html.parser")
+        if isinstance(html, str):
+            html_bytes = html.encode('utf-8')
+        else:
+            html_bytes = html
+        soup = BeautifulSoup(html_bytes, "html.parser", from_encoding="utf-8")
 
     # Search by class only — works even if parser changes <li> → something else
     for el in soup.find_all(class_="li-reviews"):
         text_el   = el.find(class_="dv-reviews-text")
         name_el   = el.find(class_="dv-reviews-name")
         rating_el = el.find(class_="rating-on")
+        
+        review_text = text_el.get_text() if text_el else ""
+        reviewer_name = name_el.get_text() if name_el else ""
+        
+        # Debug first review
+        if len(rows) == 0 and review_text:
+            arabic_chars = [c for c in review_text if '\u0600' <= c <= '\u06FF']
+            if arabic_chars:
+                log.info(f"    ✓ Arabic in extracted review: {review_text[:50]}")
+            else:
+                log.warning(f"    ✗ No Arabic in review: {review_text[:50]}")
+        
         rows.append(_make_review_row(
             shop,
-            text_el.get_text()  if text_el   else "",
-            name_el.get_text()  if name_el   else "",
+            review_text,
+            reviewer_name,
             rating_el.get("style", "") if rating_el else "",
         ))
 
@@ -599,6 +620,16 @@ def fetch_reviews_for_shop(shop_slug: str, shop: dict, page_html: str) -> list[d
             j        = json.loads(text)
             fragment = j.get("html", "")
             can_load = j.get("canLoad", False)
+            
+            # Debug: check if fragment contains Arabic text properly
+            if page_no == 1 and fragment and len(fragment) > 50:
+                # Find Arabic text in fragment for verification
+                import re
+                arabic_match = re.search(r'[\u0600-\u06FF]+', fragment)
+                if arabic_match:
+                    log.info(f"    ✓ Arabic text detected in fragment: {arabic_match.group()[:30]}")
+                else:
+                    log.warning(f"    ✗ No Arabic detected. Sample: {fragment[100:200]}")
         except (json.JSONDecodeError, ValueError):
             log.warning(f"    Reviews page {page_no} not JSON — treating as HTML fragment")
             fragment = text
@@ -725,13 +756,15 @@ def upload_image_to_s3(image_url: str, s3_path: str, s3: "boto3.client") -> str:
 
 def upload_df_to_s3(df: pd.DataFrame, s3: "boto3.client", key: str):
     """Serialize a DataFrame as UTF-8 CSV and put it in S3."""
-    buf = StringIO()
-    df.to_csv(buf, index=False, encoding="utf-8-sig")
+    # Use BytesIO to ensure proper UTF-8 encoding
+    buf = BytesIO()
+    df.to_csv(buf, index=False, encoding="utf-8")
+    buf.seek(0)
     try:
         s3.put_object(
             Bucket      = S3_BUCKET,
             Key         = key,
-            Body        = buf.getvalue().encode("utf-8"),
+            Body        = buf.getvalue(),
             ContentType = "text/csv; charset=utf-8",
         )
         log.info(f"✓  s3://{S3_BUCKET}/{key}  ({len(df)} rows)")
