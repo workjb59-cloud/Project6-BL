@@ -428,21 +428,10 @@ def _parse_reviews_from_html(html: str, shop: dict) -> list[dict]:
         name_el   = el.find(class_="dv-reviews-name")
         rating_el = el.find(class_="rating-on")
         
-        review_text = text_el.get_text() if text_el else ""
-        reviewer_name = name_el.get_text() if name_el else ""
-        
-        # Debug first review
-        if len(rows) == 0 and review_text:
-            arabic_chars = [c for c in review_text if '\u0600' <= c <= '\u06FF']
-            if arabic_chars:
-                log.info(f"    ✓ Arabic in extracted review: {review_text[:50]}")
-            else:
-                log.warning(f"    ✗ No Arabic in review: {review_text[:50]}")
-        
         rows.append(_make_review_row(
             shop,
-            review_text,
-            reviewer_name,
+            text_el.get_text() if text_el else "",
+            name_el.get_text() if name_el else "",
             rating_el.get("style", "") if rating_el else "",
         ))
 
@@ -620,16 +609,6 @@ def fetch_reviews_for_shop(shop_slug: str, shop: dict, page_html: str) -> list[d
             j        = json.loads(text)
             fragment = j.get("html", "")
             can_load = j.get("canLoad", False)
-            
-            # Debug: check if fragment contains Arabic text properly
-            if page_no == 1 and fragment and len(fragment) > 50:
-                # Find Arabic text in fragment for verification
-                import re
-                arabic_match = re.search(r'[\u0600-\u06FF]+', fragment)
-                if arabic_match:
-                    log.info(f"    ✓ Arabic text detected in fragment: {arabic_match.group()[:30]}")
-                else:
-                    log.warning(f"    ✗ No Arabic detected. Sample: {fragment[100:200]}")
         except (json.JSONDecodeError, ValueError):
             log.warning(f"    Reviews page {page_no} not JSON — treating as HTML fragment")
             fragment = text
@@ -755,16 +734,18 @@ def upload_image_to_s3(image_url: str, s3_path: str, s3: "boto3.client") -> str:
 
 
 def upload_df_to_s3(df: pd.DataFrame, s3: "boto3.client", key: str):
-    """Serialize a DataFrame as UTF-8 CSV and put it in S3."""
-    # Use BytesIO to ensure proper UTF-8 encoding
-    buf = BytesIO()
+    """Serialize a DataFrame as UTF-8 CSV with BOM and put it in S3."""
+    # Write to StringIO first, then encode to bytes with BOM
+    from io import StringIO
+    buf = StringIO()
     df.to_csv(buf, index=False, encoding="utf-8")
-    buf.seek(0)
+    # Get the string and encode with UTF-8 BOM for Excel compatibility
+    csv_bytes = buf.getvalue().encode("utf-8-sig")
     try:
         s3.put_object(
             Bucket      = S3_BUCKET,
             Key         = key,
-            Body        = buf.getvalue(),
+            Body        = csv_bytes,
             ContentType = "text/csv; charset=utf-8",
         )
         log.info(f"✓  s3://{S3_BUCKET}/{key}  ({len(df)} rows)")
