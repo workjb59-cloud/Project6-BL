@@ -13,7 +13,6 @@ jobs:
   discover:
     name: Discover Categories
     runs-on: ubuntu-latest
-    timeout-minutes: 10
     outputs:
       categories: ${{ steps.get-categories.outputs.categories }}
     
@@ -41,7 +40,6 @@ jobs:
   scrape:
     name: Scrape ${{ matrix.category }}
     runs-on: ubuntu-latest
-    timeout-minutes: 90
     needs: discover
     
     strategy:
