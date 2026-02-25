@@ -766,12 +766,28 @@ def main():
         default=None,
         help="Specific category to scrape (e.g., 'Flowers', 'Confections'). If not provided, scrapes all categories."
     )
+    parser.add_argument(
+        "--list-categories",
+        action="store_true",
+        help="List available categories as JSON and exit (for GitHub Actions dynamic matrix)"
+    )
     args = parser.parse_args()
     
     log.info(f"Run date : {TODAY}")
     log.info(f"S3 bucket: {S3_BUCKET}")
     if args.category:
         log.info(f"Target category: {args.category}")
+
+    # ── List categories mode ──────────────────────────────────────────────────
+    if args.list_categories:
+        all_shops = fetch_all_shops()
+        if not all_shops:
+            print(json.dumps([]))
+            return
+        
+        categories = sorted(set(shop["type"] or "Other" for shop in all_shops))
+        print(json.dumps(categories))
+        return
 
     s3 = boto3.client(
         "s3",

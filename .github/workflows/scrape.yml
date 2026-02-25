@@ -9,19 +9,46 @@ on:
   workflow_dispatch:
 
 jobs:
+  # ── Job 1: Discover categories dynamically ───────────────────────────────
+  discover:
+    name: Discover Categories
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      categories: ${{ steps.get-categories.outputs.categories }}
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Discover categories
+        id: get-categories
+        run: |
+          CATEGORIES=$(python scraper.py --list-categories)
+          echo "categories=$CATEGORIES" >> $GITHUB_OUTPUT
+          echo "Discovered categories: $CATEGORIES"
+
+  # ── Job 2: Scrape each category in parallel ──────────────────────────────
   scrape:
     name: Scrape ${{ matrix.category }}
     runs-on: ubuntu-latest
     timeout-minutes: 90
+    needs: discover
     
     strategy:
-      max-parallel: 3  # Run all categories in parallel
+      max-parallel: 10  # Run all categories in parallel
       fail-fast: false  # Continue other jobs if one fails
       matrix:
-        category:
-          - Flowers
-          - Confections
-          - Gifts
+        category: ${{ fromJSON(needs.discover.outputs.categories) }}
 
     env:
       # ── AWS credentials & bucket ──────────────────────────────────────────
@@ -56,4 +83,5 @@ jobs:
           aws s3 ls s3://${{ secrets.S3_BUCKET_NAME }}/bleems-data/ --recursive --human-readable \
             | grep "${{ matrix.category }}" \
             | tail -10
+
 
