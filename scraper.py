@@ -758,8 +758,20 @@ def upload_df_to_s3(df: pd.DataFrame, s3: "boto3.client", key: str):
 # Main
 # ──────────────────────────────────────────────────────────────────────────────
 def main():
+    import argparse
+    parser = argparse.ArgumentParser(description="Scrape Bleems.com shops")
+    parser.add_argument(
+        "--category",
+        type=str,
+        default=None,
+        help="Specific category to scrape (e.g., 'Flowers', 'Confections'). If not provided, scrapes all categories."
+    )
+    args = parser.parse_args()
+    
     log.info(f"Run date : {TODAY}")
     log.info(f"S3 bucket: {S3_BUCKET}")
+    if args.category:
+        log.info(f"Target category: {args.category}")
 
     s3 = boto3.client(
         "s3",
@@ -781,8 +793,17 @@ def main():
         by_type.setdefault(t, []).append(shop)
 
     log.info(f"Types detected: {sorted(by_type.keys())}")
+    
+    # ── 3. Filter by category if specified ────────────────────────────────────
+    if args.category:
+        if args.category in by_type:
+            by_type = {args.category: by_type[args.category]}
+            log.info(f"Processing only category: {args.category}")
+        else:
+            log.error(f"Category '{args.category}' not found. Available: {sorted(by_type.keys())}")
+            return
 
-    # ── 3. Process each type ──────────────────────────────────────────────────
+    # ── 4. Process each type ──────────────────────────────────────────────────
     for shop_type, shops in sorted(by_type.items()):
         log.info(f"\n{'─'*60}")
         log.info(f"Processing type: {shop_type}  ({len(shops)} shops)")

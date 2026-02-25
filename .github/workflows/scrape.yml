@@ -10,9 +10,18 @@ on:
 
 jobs:
   scrape:
-    name: Scrape & Upload to S3
+    name: Scrape ${{ matrix.category }}
     runs-on: ubuntu-latest
-
+    timeout-minutes: 90
+    
+    strategy:
+      max-parallel: 3  # Run all categories in parallel
+      fail-fast: false  # Continue other jobs if one fails
+      matrix:
+        category:
+          - Flowers
+          - Confections
+          - Gifts
 
     env:
       # ── AWS credentials & bucket ──────────────────────────────────────────
@@ -37,13 +46,14 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      # ── 4. Run scraper ──────────────────────────────────────────────────────
-      - name: Run Bleems scraper
-        run: python scraper.py
+      # ── 4. Run scraper for specific category ───────────────────────────────
+      - name: Run Bleems scraper - ${{ matrix.category }}
+        run: python scraper.py --category "${{ matrix.category }}"
 
       # ── 5. (Optional) Confirm files landed in S3 ───────────────────────────
       - name: Verify S3 upload
         run: |
-          aws s3 ls s3://${{ secrets.S3_BUCKET_NAME }}/ --recursive --human-readable \
-            | grep "$(date -u +%Y-%m-%d)" \
-            | tail -30
+          aws s3 ls s3://${{ secrets.S3_BUCKET_NAME }}/bleems-data/ --recursive --human-readable \
+            | grep "${{ matrix.category }}" \
+            | tail -10
+
